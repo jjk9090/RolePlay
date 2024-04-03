@@ -4,13 +4,9 @@ huggingface-cli download --resume-download THUDM/chatglm3-6b --local-dir THUDM/c
 ## 命令行输入
 `cd finetune`
 ## finetune
-G finetune
+G 和 D finetune
 ```
-CUDA_VISIBLE_DEVICES=2 python finetune_hf.py  dataset/weibo/like_retweet/G  model/THUDM/chatglm3-6b  configs/lora.yaml
-```
-D finetune
-```
-CUDA_VISIBLE_DEVICES=2 python finetune_hf.py  dataset/weibo/like_retweet/D  model/THUDM/chatglm3-6b  configs/lora.yaml
+CUDA_VISIBLE_DEVICES=2 python finetune_hf.py  dataset/weibo/like_retweet/G dataset/weibo/like_retweet/D  model/THUDM/chatglm3-6b  configs/lora.yaml configs/lora_D.yaml
 ```
 
 ## lora合并
