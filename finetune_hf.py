@@ -636,11 +636,13 @@ def main(
     ft_config_G = FinetuningConfig.from_file(config_file)
     tokenizer_G, model_G = load_tokenizer_and_model(model_dir, peft_config=ft_config_G.peft_config)
     data_manager_G = DataManager(data_dir, ft_config_G.data_config)
+    # 先用trainer微调生成G，使得G可以初步生成profile
     initial_train(data_manager_G, ft_config_G, tokenizer_G, model_G)
 
     ft_config_D = FinetuningConfig.from_file(config_file_d)
     tokenizer_D, model_D = load_tokenizer_and_model(model_dir, peft_config=ft_config_D.peft_config)
     data_manager_D = DataManager(data_dir_d, ft_config_D.data_config)
+    # 先用trainer微调生成D，使得D可以初步判别真实profile与生成profile
     initial_train(data_manager_D, ft_config_G, tokenizer_D, model_D)
 
     # criterion = torch.nn.BCELoss()
@@ -677,12 +679,15 @@ def main(
             start_index = prompt_G.find("我在微博上的网名是 ") + len("我在微博上的网名是 ")
             end_index = prompt_G.find(".", start_index)
             name = prompt_G[start_index:end_index]
+
+            # 得到G生成的profile
             fake_profile, history = model_G.chat(tokenizer_G, prompt_G, history=[], max_new_tokens=512)
 
             true_profile = conv[1]['content']
             real_label = "是"
             fake_label = "否"
 
+            # prompt_D 包含行为信息
             prompt_D = remove_substring(prompt_G, "请推断出")
             fake_profile = fake_profile.split('\n')[0]
             question_fake = (
@@ -696,22 +701,26 @@ def main(
             )
 
             prompt_D_true = prompt_D + question_true
+            # D对真实proile进行判断
             real_out, history = model_D.chat(tokenizer_D, prompt_D_true, history=[], max_new_tokens=512)
 
             prompt_D_fake = prompt_D + question_fake
+            # D对生成proile进行判断
             fake_out, history = model_D.chat(tokenizer_D, prompt_D_fake, history=[], max_new_tokens=512)
 
             loss_real_D = criterion(real_out, real_label)  
             loss_fake_D = criterion(fake_out, fake_label)
             loss_real_D = torch.tensor(loss_real_D, requires_grad=True)
             loss_fake_D = torch.tensor(loss_fake_D, requires_grad=True)  
+            # 计算D的loss
             loss_D = loss_real_D + loss_fake_D
 
             optimizer_D.zero_grad()                             
             loss_D.backward()                                   
             optimizer_D.step()
             lr_scheduler_D.step()
-
+            
+            # 计算G的loss
             loss_G = criterion(fake_profile, true_profile)
             loss_G = torch.tensor(loss_G, requires_grad=True)
 
