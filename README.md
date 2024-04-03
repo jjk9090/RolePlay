@@ -8,7 +8,7 @@ G finetune
 ```
 CUDA_VISIBLE_DEVICES=2 python finetune_hf.py  dataset/weibo/like_retweet/G  model/THUDM/chatglm3-6b  configs/lora.yaml
 ```
-BG finetune
+D finetune
 ```
 CUDA_VISIBLE_DEVICES=2 python finetune_hf.py  dataset/weibo/like_retweet/D  model/THUDM/chatglm3-6b  configs/lora.yaml
 ```
