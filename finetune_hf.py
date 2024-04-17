@@ -908,6 +908,7 @@ def main1(
             tmp_file = f"tmp_{time_str}.json"
             tmp_dir = 'output/tmp/'
             tmp_file_path = os.path.join(tmp_dir, tmp_file)
+            # 创建输入给D的数据
             create_batch_D(prompt_D_true, prompt_D_fake, tokenizer_D, tmp_file_path)
             tmp_dataset = load_dataset(
                 "json",
@@ -929,7 +930,7 @@ def main1(
             tmp_idx = 0
             output_D = []
             j = 0
-            # 创建输入给D的数据
+            # 输入给D的数据
             for tmp_batch in tmp_dataloader:
                 tmp_batch = {k: v.to(device) for k, v in tmp_batch.items()}
                 tmp_output = model_D(**tmp_batch)
