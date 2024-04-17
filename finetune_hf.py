@@ -1,19 +1,25 @@
 # -*- coding: utf-8 -*-
 import os
-from datetime import datetime
 import jieba
 import dataclasses as dc
 import functools
-from collections.abc import Callable, Mapping, Sequence
-from pathlib import Path
-from typing import Annotated, Any, Optional, Union
 import numpy as np
 import ruamel.yaml as yaml
 import torch
 import typer
+import json
+import nltk
+import logging
+from datetime import datetime
+from collections.abc import Callable, Mapping, Sequence
+from pathlib import Path
+from typing import Annotated, Any, Optional, Union
 from tqdm.auto import tqdm
 from datasets import Dataset, DatasetDict, NamedSplit, Split, load_dataset
 from nltk.translate.bleu_score import SmoothingFunction, sentence_bleu
+from sklearn.metrics.pairwise import cosine_similarity
+from sklearn.feature_extraction.text import CountVectorizer
+
 from peft import (
     PeftConfig,
     PeftModelForCausalLM,
@@ -22,6 +28,7 @@ from peft import (
 )
 from rouge_chinese import Rouge
 from torch import nn
+import torch.nn.functional as F
 from transformers import (
     AutoModelForCausalLM,
     AutoTokenizer,
@@ -37,17 +44,17 @@ from transformers import (
     BertTokenizer, BertModel
 )
 from transformers import DataCollatorForSeq2Seq as _DataCollatorForSeq2Seq
-
 from transformers import Seq2SeqTrainer as _Seq2SeqTrainer
 
-import nltk
-from sklearn.metrics.pairwise import cosine_similarity
-from sklearn.feature_extraction.text import CountVectorizer
+from utils.utils import set_logger, load_model_and_tokenizer_after
+from torch.utils.data import DataLoader 
+import wandb
+wandb.init(project="explicit_weibo_random")
 
+logging.getLogger('transformers').setLevel(logging.WARNING)
 ModelType = Union[PreTrainedModel, PeftModelForCausalLM]
 TokenizerType = Union[PreTrainedTokenizer, PreTrainedTokenizerFast]
 app = typer.Typer(pretty_exceptions_show_locals=False)
-
 
 class DataCollatorForSeq2Seq(_DataCollatorForSeq2Seq):
     def __call__(self, features, return_tensors=None):
@@ -387,7 +394,7 @@ def process_batch_eval(
     batched_input_ids = []
     # To avoid computing loss, we do not provide the `labels` field in the input dictionary.
     batched_output_ids = []
-
+    pass
     if batched_tools is None:
         batched_tools = [None] * len(batched_conv)
 
@@ -496,7 +503,7 @@ def compute_metrics(eval_preds: EvalPrediction, tokenizer: PreTrainedTokenizer):
         )
     return {k: np.mean(v) for k, v in metrics_dct.items()}
 
-def initial_train(data_manager, ft_config, tokenizer, model):
+def initial_train(data_manager, ft_config, tokenizer, model, auto_resume_from_checkpoint):
     train_dataset = data_manager.get_dataset(
         Split.TRAIN,
         functools.partial(
@@ -566,11 +573,40 @@ def initial_train(data_manager, ft_config, tokenizer, model):
         tokenizer=tokenizer,
         compute_metrics=functools.partial(compute_metrics, tokenizer=tokenizer),
     )
-    trainer.train()  
+    if auto_resume_from_checkpoint.upper() == "" or auto_resume_from_checkpoint is None:
+        trainer.train()
+    else:
+        output_dir = ft_config.training_args.output_dir
+        dirlist = os.listdir(output_dir)
+        checkpoint_sn = 0
+        for checkpoint_str in dirlist:
+            if checkpoint_str.find("eckpoint") > 0 and checkpoint_str.find("tmp") == -1:
+                checkpoint = int(checkpoint_str.replace("checkpoint-", ""))
+                if checkpoint > checkpoint_sn:
+                    checkpoint_sn = checkpoint
+        if auto_resume_from_checkpoint.upper() == "YES":
+            if checkpoint_sn > 0:
+                model.gradient_checkpointing_enable()
+                model.enable_input_require_grads()
+                checkpoint_directory = os.path.join(output_dir, "checkpoint-" + str(checkpoint_sn))
+                print("resume checkpoint from  checkpoint-" + str(checkpoint_sn))
+                trainer.train(resume_from_checkpoint=checkpoint_directory)
+            else:
+                trainer.train()
+        else:
+            if auto_resume_from_checkpoint.isdigit():
+                if int(auto_resume_from_checkpoint) > 0:
+                    checkpoint_sn = int(auto_resume_from_checkpoint)
+                    model.gradient_checkpointing_enable()
+                    model.enable_input_require_grads()
+                    checkpoint_directory = os.path.join(output_dir, "checkpoint-" + str(checkpoint_sn))
+                    print("resume checkpoint from  checkpoint-" + str(checkpoint_sn))
+                    trainer.train(resume_from_checkpoint=checkpoint_directory)
+            else:
+                print(auto_resume_from_checkpoint,
+                      "The specified checkpoint sn(" + auto_resume_from_checkpoint + ") has not been saved. Please search for the correct chkeckpoint in the model output directory")
+
     # test stage
-    if test_dataset is not None:
-        output = trainer.predict(test_dataset)
-        print(output)
     return test_dataset
 
 def remove_substring(string, substring):
@@ -616,9 +652,143 @@ def _save(model, tokenizer, output_dir, state_dict=None):
     model.save_pretrained(output_dir, state_dict=state_dict)
     tokenizer.save_pretrained(output_dir, state_dict=state_dict)
 
+def tokenize_function(batch, tokenizer):
+    max_input_length = 128 
+    max_output_length = 256
+    batched_conv = batch['conversations']
+    batched_input_ids = []
+    batched_labels = []
+
+    for conv in batched_conv:
+        input_ids, loss_masks = [
+            tokenizer.get_command('[gMASK]'),
+            tokenizer.get_command('sop'),
+        ], [False, False]
+        for message in conv:
+            if message['role'] in ('system', 'user'):
+                loss_mask_val = False
+            else:
+                loss_mask_val = True
+            new_input_ids = tokenizer.build_single_message(
+                message['role'], '', message['content']
+            )
+            new_loss_masks = [loss_mask_val] * len(new_input_ids)
+            input_ids += new_input_ids
+            loss_masks += new_loss_masks
+
+        input_ids.append(tokenizer.eos_token_id)
+        loss_masks = [False, *loss_masks]
+        labels = []
+        for input_id, mask in zip(input_ids, loss_masks):
+            if mask:
+                labels.append(input_id)
+            else:
+                labels.append(-100)
+        max_length = max_input_length + max_output_length + 1
+        batched_input_ids.append(input_ids[:max_length])
+        batched_labels.append(labels[:max_length])
+    return {'input_ids': batched_input_ids, 'labels': batched_labels}
+
+def tokenize_function_one(batch, tokenizer):
+    max_input_length = 128 
+    max_output_length = 256
+    batched_conv = batch['conversations']
+    batched_input_ids = []
+    batched_labels = []
+
+    conv = batched_conv
+    input_ids, loss_masks = [
+        tokenizer.get_command('[gMASK]'),
+        tokenizer.get_command('sop'),
+    ], [False, False]
+    for message in conv:
+        if message['role'] in ('system', 'user'):
+            loss_mask_val = False
+        else:
+            loss_mask_val = True
+        new_input_ids = tokenizer.build_single_message(
+            message['role'], '', message['content']
+        )
+        new_loss_masks = [loss_mask_val] * len(new_input_ids)
+        input_ids += new_input_ids
+        loss_masks += new_loss_masks
+
+    input_ids.append(tokenizer.eos_token_id)
+    loss_masks = [False, *loss_masks]
+    labels = []
+    for input_id, mask in zip(input_ids, loss_masks):
+        if mask:
+            labels.append(input_id)
+        else:
+            labels.append(-100)
+    max_length = max_input_length + max_output_length + 1
+    batched_input_ids.append(input_ids[:max_length])
+    batched_labels.append(labels[:max_length])
+    return {'input_ids': batched_input_ids, 'labels': batched_labels}
+
+def create_batch_D(prompt_D_true, prompt_D_fake, tokenizer, tmp_file):
+    infos = []
+    batch_true = {}
+    batch_true['conversations'] = []
+    batch_true['conversations'].append({
+        "role": "user",
+        "content": prompt_D_true
+    })
+            
+    batch_true['conversations'].append({
+        "role": "assistant",
+        "content": "是"
+    })
+    # batch_true = tokenize_function_one(batch_true, tokenizer)
+
+    batch_fake = {}
+    batch_fake['conversations'] = []
+    batch_fake['conversations'].append({
+        "role": "user",
+        "content": prompt_D_fake
+    })
+            
+    batch_fake['conversations'].append({
+        "role": "assistant",
+        "content": "否"
+    })
+    # batch_fake = tokenize_function_one(batch_fake, tokenizer)
+    infos.append(batch_true)
+    infos.append(batch_fake)
+    with open(tmp_file, "w", encoding="utf-8") as f:
+        for e in infos:
+            f.write(json.dumps(e, ensure_ascii=False) + "\n")
+            
+class MyDataset(Dataset):
+    def __init__(self, batch):
+        self.batch = batch
+
+    def __len__(self):
+        return len(self.batch['input_ids'])  # 根据你的数据结构进行调整
+
+    def __getitem__(self, idx):
+        input_ids = torch.tensor(self.batch['input_ids'][idx])
+        labels = torch.tensor(self.batch['labels'][idx])
+        return {'input_ids': input_ids, 'labels': labels}
+
+def similarity(fake_profile_text, True_profile_text):
+    tokenizer = BertTokenizer.from_pretrained("model/bert-base-uncased")
+    model = BertModel.from_pretrained("model/bert-base-uncased")
+
+    fake_tokens = tokenizer.encode(fake_profile_text, add_special_tokens=False, truncation=True, padding=True, return_tensors="pt")
+    True_tokens = tokenizer.encode(True_profile_text, add_special_tokens=False, truncation=True, padding=True, return_tensors="pt")
+
+    fake_embeddings = model(fake_tokens).last_hidden_state.mean(dim=1).detach().numpy()
+    True_embeddings = model(True_tokens).last_hidden_state.mean(dim=1).detach().numpy()
+
+    similarity = cosine_similarity(fake_embeddings, True_embeddings)
+    loss = 1 - similarity
+    return loss
+
 @app.command()
-def main(
+def main1(
         data_dir: Annotated[str, typer.Argument(help='')],
+        mask_type: Annotated[str, typer.Argument(help='mask type')],
         data_dir_d: Annotated[str, typer.Argument(help='')],
         model_dir: Annotated[
             str,
@@ -628,36 +798,42 @@ def main(
         ],
         config_file: Annotated[str, typer.Argument(help='')],
         config_file_d: Annotated[str, typer.Argument(help='')],
+        log_file: Annotated[str, typer.Argument(help='')],
+        output_dir: Annotated[str, typer.Argument(help='')],
+        output_dir_d: Annotated[str, typer.Argument(help='')],
         auto_resume_from_checkpoint: str = typer.Argument(
             default='',
             help='If entered as yes, automatically use the latest save checkpoint. If it is a numerical example 12 15, use the corresponding save checkpoint. If the input is no, restart training'
         ),
 ):
+    time_str = datetime.now().strftime("%Y-%m-%d-%H_%M_%S")
+    logger = set_logger(log_file, time_str)
+
     ft_config_G = FinetuningConfig.from_file(config_file)
+    ft_config_G.training_args.output_dir = f"{output_dir}{time_str}/"
     tokenizer_G, model_G = load_tokenizer_and_model(model_dir, peft_config=ft_config_G.peft_config)
-    data_manager_G = DataManager(data_dir, ft_config_G.data_config)
-    # 先用trainer微调生成G，使得G可以初步生成profile
-    initial_train(data_manager_G, ft_config_G, tokenizer_G, model_G)
+    data_manager_G = DataManager(data_dir + "all/", ft_config_G.data_config)
+    test_dataset_G = initial_train(data_manager_G, ft_config_G, tokenizer_G, model_G, auto_resume_from_checkpoint)
 
     ft_config_D = FinetuningConfig.from_file(config_file_d)
+    ft_config_D.training_args.output_dir = f"{output_dir_d}{time_str}/"
     tokenizer_D, model_D = load_tokenizer_and_model(model_dir, peft_config=ft_config_D.peft_config)
     data_manager_D = DataManager(data_dir_d, ft_config_D.data_config)
-    # 先用trainer微调生成D，使得D可以初步判别真实profile与生成profile
-    initial_train(data_manager_D, ft_config_G, tokenizer_D, model_D)
+    test_dataset_D = initial_train(data_manager_D, ft_config_D, tokenizer_D, model_D, auto_resume_from_checkpoint)
 
     # criterion = torch.nn.BCELoss()
     optimizer_G = AdamW(model_G.parameters(), lr=5e-5)
     optimizer_D = AdamW(model_D.parameters(), lr=5e-5)
 
-    test_dataset_G = load_dataset(
+    val_dataset_G = load_dataset(
         "json",
-        data_dir=data_dir,
-        data_files=ft_config_G.data_config.data_files.get(Split.TEST),
+        data_dir=data_dir + mask_type,
+        data_files=ft_config_G.data_config.data_files.get(Split.VALIDATION),
         num_proc=ft_config_G.data_config.num_proc,
     )
-    num_epochs = 100
-    num_training_steps = num_epochs * len(test_dataset_G)
-
+    num_epochs = 300
+    num_training_steps = num_epochs * len(val_dataset_G['train'])
+    print(num_training_steps)
     lr_scheduler_G = get_scheduler(
         "linear",
         optimizer=optimizer_G,
@@ -673,27 +849,54 @@ def main(
     )
 
     progress_bar = tqdm(range(num_training_steps))
+    data_collator_G = DataCollatorForSeq2Seq(
+        tokenizer=tokenizer_G,
+        padding=True,
+        max_length=128, 
+        return_tensors='pt',
+    )
+    data_collator_D = DataCollatorForSeq2Seq(
+        tokenizer=tokenizer_D,
+        padding=True,
+        max_length=128, 
+        return_tensors='pt',
+    )
+    remove_columns = val_dataset_G['train'].column_names
+    tokenized_datasets_G = val_dataset_G['train'].map(
+        tokenize_function, 
+        batched=True, 
+        remove_columns=remove_columns, 
+        num_proc=16,
+        fn_kwargs={"tokenizer": tokenizer_G}
+    )
+    tokenized_datasets_G.set_format("torch")
+    val_dataloader_G = DataLoader(
+        tokenized_datasets_G, shuffle=True, batch_size=1, collate_fn=data_collator_G
+    )
+    device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
+    model_G.to(device)
+    model_D.to(device)
     for epoch in range(num_epochs):
-        for conv in test_dataset_G['train']['conversations']:
+        idx = 0
+        loss_G_total = 0.0
+        loss_D_total = 0.0
+        for conv, input1 in zip(val_dataset_G['train']['conversations'], val_dataloader_G):
+            idx += 1
+            batch1 = {k: v.to(device) for k, v in input1.items()}
+            output_G = model_G(**batch1)
+            loss_G0 = output_G.loss
+
             prompt_G = conv[0]['content']
-            start_index = prompt_G.find("我在微博上的网名是 ") + len("我在微博上的网名是 ")
-            end_index = prompt_G.find(".", start_index)
-            name = prompt_G[start_index:end_index]
-
-            # 得到G生成的profile
             fake_profile, history = model_G.chat(tokenizer_G, prompt_G, history=[], max_new_tokens=512)
-
-            true_profile = conv[1]['content']
-            real_label = "是"
-            fake_label = "否"
-
-            # prompt_D 包含行为信息
+            
+            # behavior data
             prompt_D = remove_substring(prompt_G, "请推断出")
             fake_profile = fake_profile.split('\n')[0]
             question_fake = (
                     f"请判断[{fake_profile}]这个profile是否属于我吗？请注意这只是你的判断，你事先不知道我的信息。请以下列格式清楚作答:\n"
                 +   f"是/否\n"
             )
+            true_profile = conv[1]['content']
             true_profile = true_profile.split('\n')[0]
             question_true = (
                     f"请判断[{true_profile}]这个profile是否属于我吗？请注意这只是你的判断，你事先不知道我的信息。请以下列格式清楚作答:\n"
@@ -701,27 +904,81 @@ def main(
             )
 
             prompt_D_true = prompt_D + question_true
-            # D对真实proile进行判断
-            real_out, history = model_D.chat(tokenizer_D, prompt_D_true, history=[], max_new_tokens=512)
-
             prompt_D_fake = prompt_D + question_fake
-            # D对生成proile进行判断
-            fake_out, history = model_D.chat(tokenizer_D, prompt_D_fake, history=[], max_new_tokens=512)
+            tmp_file = f"tmp_{time_str}.json"
+            tmp_dir = 'output/tmp/'
+            tmp_file_path = os.path.join(tmp_dir, tmp_file)
+            create_batch_D(prompt_D_true, prompt_D_fake, tokenizer_D, tmp_file_path)
+            tmp_dataset = load_dataset(
+                "json",
+                data_dir=tmp_dir,
+                data_files=tmp_file,
+                num_proc=ft_config_D.data_config.num_proc,
+            )
+            tokenized_tmp_datasets = tmp_dataset['train'].map(
+                tokenize_function, 
+                batched=True, 
+                remove_columns=remove_columns, 
+                num_proc=16,
+                fn_kwargs={"tokenizer": tokenizer_G}
+            )
+            tokenized_tmp_datasets.set_format("torch")
+            tmp_dataloader = DataLoader(
+                tokenized_tmp_datasets, shuffle=True, batch_size=1, collate_fn=data_collator_G
+            )
+            tmp_idx = 0
+            output_D = []
+            j = 0
+            # 创建输入给D的数据
+            for tmp_batch in tmp_dataloader:
+                tmp_batch = {k: v.to(device) for k, v in tmp_batch.items()}
+                tmp_output = model_D(**tmp_batch)
+                prediction_D = tmp_output.logits
+                shape_D = prediction_D.shape 
+                # judge = ''
+                # for i in range(shape_D[1]):
+                #     if i == 0:
+                #         continue
+                #     predicted_token_id_D = prediction_D[0, i].argmax(axis=-1)
+                #     judge += tokenizer_D.decode(predicted_token_id_D)
+                # if j == 0:
+                #     label = '是'
+                # else:
+                #     label = '否'
+                if j == 0:
+                    label = torch.ones_like(prediction_D).cuda()
+                else:
+                    label = torch.zeros_like(prediction_D).cuda()
+                j += 1
+                output_D.append([prediction_D, label])
+            
+            predictions_D_true =  output_D[0][0]
+            targets_D_true = output_D[0][1]
 
-            loss_real_D = criterion(real_out, real_label)  
-            loss_fake_D = criterion(fake_out, fake_label)
-            loss_real_D = torch.tensor(loss_real_D, requires_grad=True)
-            loss_fake_D = torch.tensor(loss_fake_D, requires_grad=True)  
-            # 计算D的loss
-            loss_D = loss_real_D + loss_fake_D
+            predictions_D_fake =  output_D[1][0]
+            targets_D_fake = output_D[1][1]
+
+            predictions_G = output_D[1][0].detach().clone()
+            predictions_G.requires_grad_(True)
+            targets_G = torch.ones_like(predictions_G).cuda()
+            targets_G.requires_grad_(True)
+
+            loss_fn = torch.nn.BCEWithLogitsLoss(reduction='mean')
+
+            loss_D_true = loss_fn(predictions_D_true, targets_D_true)
+            loss_D_fake = loss_fn(predictions_D_fake, targets_D_fake)
+            # get D's loss
+            loss_D = loss_D_true + loss_D_fake
+            loss_D = torch.tensor(loss_D, requires_grad=True)
 
             optimizer_D.zero_grad()                             
             loss_D.backward()                                   
             optimizer_D.step()
             lr_scheduler_D.step()
-            
-            # 计算G的loss
-            loss_G = criterion(fake_profile, true_profile)
+
+            # get G's loss
+            loss_G = loss_fn(predictions_G, targets_G)
+            # loss_G = similarity(predictions_D_fake, targets_D_true)
             loss_G = torch.tensor(loss_G, requires_grad=True)
 
             optimizer_G.zero_grad()                                             
@@ -729,10 +986,18 @@ def main(
             optimizer_G.step()  
             lr_scheduler_G.step()
             progress_bar.update(1)
+
+            loss_G_total += loss_G.item()
+            loss_D_total += loss_D.item()
+            logger.info(f"{epoch}-{idx}: D's loss {loss_D} G's loss {loss_G}")
         
-        if epoch % 10 == 0:
+        avg_loss_G = loss_G_total / len(val_dataset_G['train']['conversations'])
+        avg_loss_D = loss_D_total / len(val_dataset_G['train']['conversations'])
+        logger.info(f"{epoch}: D's loss {avg_loss_D} G's loss {avg_loss_G}")
+        wandb.log({'epoch': epoch, 'avg_loss_D': avg_loss_D, 'avg_loss_G': avg_loss_G})
+        if (epoch + 1) % 10 == 0:
             _save(model_G, tokenizer_G, f"{ft_config_G.training_args.output_dir}{epoch}")
             _save(model_D, tokenizer_D, f"{ft_config_D.training_args.output_dir}{epoch}")
-        
+     
 if __name__ == '__main__':
     app()
