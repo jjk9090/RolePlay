@@ -1024,7 +1024,8 @@ def main(
     device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
     model_G.to(device)
     model_BG.to(device)
-
+    bert_model = bert_model.to(device)
+    
     config = AutoConfig.from_pretrained(model_dir, trust_remote_code=True)
     config.update({
         'pre_seq_len': 256,
